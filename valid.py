@@ -73,7 +73,7 @@ def get_mixture_paths(
 
             if verbose: print(f"Found {len(potential_song_folders)} potential song folders in {path_dir_root}. Checking for pairs...")
 
-            file_types = ['wav', 'flac'] 
+            file_types = ['mp3', 'wav', 'flac'] 
             dirty_names = [f"dirty.{ext}" for ext in file_types]
             clean_names = [f"clean.{ext}" for ext in file_types]
 
@@ -186,30 +186,25 @@ def process_audio_files(
         original_clean = None
         if is_enhancement:
             folder = os.path.dirname(path_to_input)
-            base_name = os.path.splitext(os.path.basename(path_to_input))[0]
-            potential_orig_names = [
-                f"restored.wav", f"restored.flac",
-                f"{base_name}_orig.wav", f"{base_name}_orig.flac",
-                f"{base_name}_clean.wav", f"{base_name}_clean.flac",
-                f"{base_name}.wav", f"{base_name}.flac"
-            ]
+            clean_names_to_check = ["clean.wav", "clean.flac"]
             path_to_original = None
-            for name in potential_orig_names:
-                 potential_path = os.path.join(folder, name)
-                 if os.path.exists(potential_path):
-                      path_to_original = potential_path
-                      if verbose: print(f"Found original reference: {path_to_original}")
-                      break
+            for clean_name in clean_names_to_check:
+                potential_path = os.path.join(folder, clean_name)
+                if os.path.exists(potential_path):
+                    path_to_original = potential_path
+                    if verbose: print(f"Found original reference: {path_to_original}")
+                    break
 
             if path_to_original:
                  original_clean, sr_orig = read_audio_transposed(path_to_original)
                  if original_clean is None:
                       print(f"Warning: Failed to read original audio {path_to_original} for {path_to_input}. Cannot calculate metrics.")
                  elif sr != sr_orig:
-                      print(f"Warning: SR mismatch between input ({sr}Hz) and original ({sr_orig}Hz) for {base_name}. Skipping metrics.")
+                      base_name_input = os.path.splitext(os.path.basename(path_to_input))[0]
+                      print(f"Warning: SR mismatch between input ({sr}Hz) and original ({sr_orig}Hz) for {base_name_input}. Skipping metrics.")
                       original_clean = None
             else:
-                 print(f"Warning: Could not find original clean audio for {path_to_input}. Cannot calculate metrics.")
+                 print(f"Warning: Could not find 'clean.wav' or 'clean.flac' in {folder} for input {path_to_input}. Cannot calculate metrics.")
 
         mix_for_model = input_audio.copy()
         mix_orig_for_metrics = original_clean.copy() if original_clean is not None else None
