@@ -2,672 +2,665 @@
 __author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
 
 import argparse
-import numpy as np
-import torch
-import torch.nn as nn
-import yaml
+import time
 import os
+import glob
+import torch
+import librosa
+import numpy as np
 import soundfile as sf
-import matplotlib.pyplot as plt
-from ml_collections import ConfigDict
-from omegaconf import OmegaConf
 from tqdm.auto import tqdm
-from typing import Dict, List, Tuple, Any, Union
-import loralib as lora
+from ml_collections import ConfigDict
+from typing import Tuple, Dict, List, Union
+import torch.nn as nn
+
+from utils import demix, get_model_from_config, prefer_target_instrument, draw_spectrogram
+from utils import normalize_audio, denormalize_audio, apply_tta, read_audio_transposed, load_start_checkpoint
+from metrics import get_metrics
+import warnings
+
+warnings.filterwarnings("ignore")
 
 
-def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaConf]:
+def logging(logs: List[str], text: str, verbose_logging: bool = False) -> None:
+    """ Log validation information. """
+    print(text)
+    if verbose_logging:
+        logs.append(text)
+
+
+def write_results_in_file(store_dir: str, logs: List[str]) -> None:
+    """ Write logs to a results file. """
+    if not store_dir: return # Skip if no directory specified
+    try:
+        with open(os.path.join(store_dir, 'results.txt'), 'w') as out:
+            for item in logs:
+                out.write(item + "\n")
+    except Exception as e:
+        print(f"Error writing results file: {e}")
+
+
+def get_mixture_paths(
+    args,
+    verbose: bool,
+    config: ConfigDict,
+    extension: str, 
+    is_enhancement: bool = False
+) -> List[str]:
     """
-    Load the configuration from the specified path based on the model type.
-
-    Parameters:
-    ----------
-    model_type : str
-        The type of model to load (e.g., 'htdemucs', 'mdx23c', etc.).
-    config_path : str
-        The path to the YAML or OmegaConf configuration file.
-
-    Returns:
-    -------
-    config : Any
-        The loaded configuration, which can be in different formats (e.g., OmegaConf or ConfigDict).
-
-    Raises:
-    ------
-    FileNotFoundError:
-        If the configuration file at `config_path` is not found.
-    ValueError:
-        If there is an error loading the configuration file.
+    Retrieve paths to input files for validation.
+    For enhancement (Type 6), finds 'dirty.wav'/'dirty.flac' in subfolders if 'clean' pair exists.
+    For separation, finds mixture files.
     """
     try:
-        with open(config_path, 'r') as f:
-            if model_type == 'htdemucs':
-                config = OmegaConf.load(config_path)
-            else:
-                config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
-            return config
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Configuration file not found at {config_path}")
-    except Exception as e:
-        raise ValueError(f"Error loading configuration: {e}")
+        valid_path_list = args.valid_path
+    except AttributeError:
+        print('Error: --valid_path argument missing.')
+        return []
+
+    all_input_paths = []
+    task_name = "enhancement inputs" if is_enhancement else "mixtures"
+
+    for path_dir_root in valid_path_list: 
+        if is_enhancement:
+            potential_song_folders = []
+            try:
+                 items = sorted(glob.glob(os.path.join(path_dir_root, '*')))
+                 potential_song_folders = [p for p in items if os.path.isdir(p) and os.path.basename(p)[0] != '.']
+            except Exception as e:
+                 print(f"Error searching for song folders in {path_dir_root}: {e}")
+                 continue
+
+            if verbose: print(f"Found {len(potential_song_folders)} potential song folders in {path_dir_root}. Checking for pairs...")
+
+            file_types = ['wav', 'flac'] 
+            dirty_names = [f"dirty.{ext}" for ext in file_types]
+            clean_names = [f"clean.{ext}" for ext in file_types]
+
+            for song_folder_path in potential_song_folders:
+                dirty_path_found = None
+                clean_path_found = None
+                # Check for dirty file
+                for d_name in dirty_names:
+                    potential_path = os.path.join(song_folder_path, d_name)
+                    if os.path.isfile(potential_path):
+                        dirty_path_found = potential_path
+                        break
+                # Check for clean file
+                for c_name in clean_names:
+                    potential_path = os.path.join(song_folder_path, c_name)
+                    if os.path.isfile(potential_path):
+                        clean_path_found = potential_path
+                        break
+
+                if dirty_path_found and clean_path_found:
+                    all_input_paths.append(dirty_path_found)
+                    if verbose: print(f"  Found valid pair in: {song_folder_path} -> Adding input: {dirty_path_found}")
+
+        else: 
+            try:
+                target_pattern = os.path.join(path_dir_root, f'*/mixture.{extension}')
+                if verbose: print(f"Searching for separation inputs matching: {target_pattern}")
+                found_files = sorted(glob.glob(target_pattern))
+                all_input_paths.extend([f for f in found_files if os.path.basename(os.path.dirname(f))[0] != '.'])
+            except Exception as e:
+                 print(f"Error searching path {path_dir_root} for mixtures: {e}")
+
+    all_input_paths = sorted(list(set(all_input_paths)))
+
+    if verbose:
+        print(f'Total {task_name} identified to process: {len(all_input_paths)}')
+        if len(all_input_paths) == 0:
+             print(f"Please check the structure and naming convention in: {valid_path_list}")
+        if hasattr(config, 'inference'):
+             print(f'Overlap: {config.inference.get("num_overlap", "N/A")} Batch size: {config.inference.get("batch_size", "N/A")}')
+
+    return all_input_paths
 
 
-def get_model_from_config(model_type: str, config_path: str) -> Tuple:
-    """
-    Load the model specified by the model type and configuration file.
+def update_metrics_and_pbar(
+        track_metrics: Dict,
+        all_metrics: Dict,
+        instr: str,
+        pbar_dict: Dict,
+        mixture_paths_iter: Union[List[str], tqdm],
+        verbose: bool = False
+) -> None:
+    """ Update metrics dictionary and progress bar. """
+    for metric_name, metric_value in track_metrics.items():
+        if verbose:
+            print(f"Metric {metric_name:11s} value: {metric_value:.4f}")
+        if metric_name not in all_metrics: all_metrics[metric_name] = {}
+        if instr not in all_metrics[metric_name]: all_metrics[metric_name][instr] = []
+        all_metrics[metric_name][instr].append(metric_value)
+        pbar_dict[f'{metric_name}_{instr}'] = f"{metric_value:.4f}" # Format value for display
 
-    Parameters:
-    ----------
-    model_type : str
-        The type of model to load (e.g., 'mdx23c', 'htdemucs', 'scnet', etc.).
-    config_path : str
-        The path to the configuration file (YAML or OmegaConf format).
-
-    Returns:
-    -------
-    model : nn.Module or None
-        The initialized model based on the `model_type`, or None if the model type is not recognized.
-    config : Any
-        The configuration used to initialize the model. This could be in different formats
-        depending on the model type (e.g., OmegaConf, ConfigDict).
-
-    Raises:
-    ------
-    ValueError:
-        If the `model_type` is unknown or an error occurs during model initialization.
-    """
-
-    config = load_config(model_type, config_path)
-
-    if model_type == 'mdx23c':
-        from models.mdx23c_tfc_tdf_v3 import TFC_TDF_net
-        model = TFC_TDF_net(config)
-    elif model_type == 'htdemucs':
-        from models.demucs4ht import get_model
-        model = get_model(config)
-    elif model_type == 'segm_models':
-        from models.segm_models import Segm_Models_Net
-        model = Segm_Models_Net(config)
-    elif model_type == 'torchseg':
-        from models.torchseg_models import Torchseg_Net
-        model = Torchseg_Net(config)
-    elif model_type == 'mel_band_roformer':
-        from models.bs_roformer import MelBandRoformer
-        model = MelBandRoformer(**dict(config.model))
-    elif model_type == 'mel_band_roformer_experimental':
-        from models.bs_roformer.mel_band_roformer_experimental import MelBandRoformer
-        model = MelBandRoformer(**dict(config.model))
-    elif model_type == 'bs_roformer':
-        from models.bs_roformer import BSRoformer
-        model = BSRoformer(**dict(config.model))
-    elif model_type == 'bs_roformer_experimental':
-        from models.bs_roformer.bs_roformer_experimental import BSRoformer
-        model = BSRoformer(**dict(config.model))
-    elif model_type == 'swin_upernet':
-        from models.upernet_swin_transformers import Swin_UperNet_Model
-        model = Swin_UperNet_Model(config)
-    elif model_type == 'bandit':
-        from models.bandit.core.model import MultiMaskMultiSourceBandSplitRNNSimple
-        model = MultiMaskMultiSourceBandSplitRNNSimple(**config.model)
-    elif model_type == 'bandit_v2':
-        from models.bandit_v2.bandit import Bandit
-        model = Bandit(**config.kwargs)
-    elif model_type == 'scnet_unofficial':
-        from models.scnet_unofficial import SCNet
-        model = SCNet(**config.model)
-    elif model_type == 'scnet':
-        from models.scnet import SCNet
-        model = SCNet(**config.model)
-    elif model_type == 'scnet_tran':
-        from models.scnet.scnet_tran import SCNet_Tran
-        model = SCNet_Tran(**config.model)
-    elif model_type == 'apollo':
-        from models.look2hear.models import BaseModel
-        model = BaseModel.apollo(**config.model)
-    elif model_type == 'bs_mamba2':
-        from models.ts_bs_mamba2 import Separator
-        model = Separator(**config.model)
-    elif model_type == 'experimental_mdx23c_stht':
-        from models.mdx23c_tfc_tdf_v3_with_STHT import TFC_TDF_net
-        model = TFC_TDF_net(config)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-
-    return model, config
+    if isinstance(mixture_paths_iter, tqdm):
+        try:
+            mixture_paths_iter.set_postfix(pbar_dict)
+        except Exception:
+            pass # Ignore if tqdm object is closed or invalid
 
 
-def read_audio_transposed(path: str, instr: str = None, skip_err: bool = False) -> Tuple[np.ndarray, int]:
-    """
-    Reads an audio file, ensuring mono audio is converted to two-dimensional format,
-    and transposes the data to have channels as the first dimension.
-    Parameters
-    ----------
-    path : str
-        Path to the audio file.
-    skip_err: bool
-        If true, not raise errors
-    instr:
-        name of instument
-    Returns
-    -------
-    Tuple[np.ndarray, int]
-        A tuple containing:
-        - Transposed audio data as a NumPy array with shape (channels, length).
-          For mono audio, the shape will be (1, length).
-        - Sampling rate (int), e.g., 44100.
-    """
+def process_audio_files(
+    input_paths: List[str], 
+    model: torch.nn.Module,
+    args,
+    config,
+    device: torch.device,
+    verbose: bool = False,
+    is_tqdm: bool = True
+) -> Dict[str, Dict[str, List[float]]]:
+    """ Process audio files for validation (separation or enhancement). """
+    is_enhancement = config.training.get('is_gan', False) and args.model_type == 'apollo'
 
-    try:
-        mix, sr = sf.read(path)
-    except Exception as e:
-        if skip_err:
-            print(f"No stem {instr}: skip!")
-            return None, None
-        else:
-            raise RuntimeError(f"Error reading the file at {path}: {e}")
-    else:
-        if len(mix.shape) == 1:  # For mono audio
-            mix = np.expand_dims(mix, axis=-1)
-        return mix.T, sr
-
-
-def normalize_audio(audio: np.ndarray) -> tuple[np.ndarray, Dict[str, float]]:
-    """
-    Normalize an audio signal by subtracting the mean and dividing by the standard deviation.
-
-    Parameters:
-    ----------
-    audio : np.ndarray
-        Input audio array with shape (channels, time) or (time,).
-
-    Returns:
-    -------
-    tuple[np.ndarray, dict[str, float]]
-        - Normalized audio array with the same shape as the input.
-        - Dictionary containing the mean and standard deviation of the original audio.
-    """
-
-    mono = audio.mean(0)
-    mean, std = mono.mean(), mono.std()
-    return (audio - mean) / std, {"mean": mean, "std": std}
-
-
-def denormalize_audio(audio: np.ndarray, norm_params: Dict[str, float]) -> np.ndarray:
-    """
-    Denormalize an audio signal by reversing the normalization process (multiplying by the standard deviation
-    and adding the mean).
-
-    Parameters:
-    ----------
-    audio : np.ndarray
-        Normalized audio array to be denormalized.
-    norm_params : dict[str, float]
-        Dictionary containing the 'mean' and 'std' values used for normalization.
-
-    Returns:
-    -------
-    np.ndarray
-        Denormalized audio array with the same shape as the input.
-    """
-
-    return audio * norm_params["std"] + norm_params["mean"]
-
-
-def apply_tta(
-        config,
-        model: torch.nn.Module,
-        mix: torch.Tensor,
-        waveforms_orig: Dict[str, torch.Tensor],
-        device: torch.device,
-        model_type: str
-) -> Dict[str, torch.Tensor]:
-    """
-    Apply Test-Time Augmentation (TTA) for source separation.
-
-    This function processes the input mixture with test-time augmentations, including
-    channel inversion and polarity inversion, to enhance the separation results. The
-    results from all augmentations are averaged to produce the final output.
-
-    Parameters:
-    ----------
-    config : Any
-        Configuration object containing model and processing parameters.
-    model : torch.nn.Module
-        The trained model used for source separation.
-    mix : torch.Tensor
-        The mixed audio tensor with shape (channels, time).
-    waveforms_orig : Dict[str, torch.Tensor]
-        Dictionary of original separated waveforms (before TTA) for each instrument.
-    device : torch.device
-        Device (CPU or CUDA) on which the model will be executed.
-    model_type : str
-        Type of the model being used (e.g., "demucs", "custom_model").
-
-    Returns:
-    -------
-    Dict[str, torch.Tensor]
-        Updated dictionary of separated waveforms after applying TTA.
-    """
-    # Create augmentations: channel inversion and polarity inversion
-    track_proc_list = [mix[::-1].copy(), -1.0 * mix.copy()]
-
-    # Process each augmented mixture
-    for i, augmented_mix in enumerate(track_proc_list):
-        waveforms = demix(config, model, augmented_mix, device, model_type=model_type)
-        for el in waveforms:
-            if i == 0:
-                waveforms_orig[el] += waveforms[el][::-1].copy()
-            else:
-                waveforms_orig[el] -= waveforms[el]
-
-    # Average the results across augmentations
-    for el in waveforms_orig:
-        waveforms_orig[el] /= len(track_proc_list) + 1
-
-    return waveforms_orig
-
-
-def _getWindowingArray(window_size: int, fade_size: int) -> torch.Tensor:
-    """
-    Generate a windowing array with a linear fade-in at the beginning and a fade-out at the end.
-
-    This function creates a window of size `window_size` where the first `fade_size` elements
-    linearly increase from 0 to 1 (fade-in) and the last `fade_size` elements linearly decrease
-    from 1 to 0 (fade-out). The middle part of the window is filled with ones.
-
-    Parameters:
-    ----------
-    window_size : int
-        The total size of the window.
-    fade_size : int
-        The size of the fade-in and fade-out regions.
-
-    Returns:
-    -------
-    torch.Tensor
-        A tensor of shape (window_size,) containing the generated windowing array.
-
-    Example:
-    -------
-    If `window_size=10` and `fade_size=3`, the output will be:
-    tensor([0.0000, 0.5000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 1.0000, 0.5000, 0.0000])
-    """
-
-    fadein = torch.linspace(0, 1, fade_size)
-    fadeout = torch.linspace(1, 0, fade_size)
-
-    window = torch.ones(window_size)
-    window[-fade_size:] = fadeout
-    window[:fade_size] = fadein
-    return window
-
-
-def demix(
-        config: ConfigDict,
-        model: torch.nn.Module,
-        mix: torch.Tensor,
-        device: torch.device,
-        model_type: str,
-        pbar: bool = False
-) -> Tuple[List[Dict[str, np.ndarray]], np.ndarray]:
-    """
-    Unified function for audio source separation with support for multiple processing modes.
-
-    This function separates audio into its constituent sources using either a generic custom logic
-    or a Demucs-specific logic. It supports batch processing and overlapping window-based chunking
-    for efficient and artifact-free separation.
-
-    Parameters:
-    ----------
-    config : ConfigDict
-        Configuration object containing audio and inference settings.
-    model : torch.nn.Module
-        The trained model used for audio source separation.
-    mix : torch.Tensor
-        Input audio tensor with shape (channels, time).
-    device : torch.device
-        The computation device (CPU or CUDA).
-    model_type : str, optional
-        Processing mode:
-            - "demucs" for logic specific to the Demucs model.
-        Default is "generic".
-    pbar : bool, optional
-        If True, displays a progress bar during chunk processing. Default is False.
-
-    Returns:
-    -------
-    Union[Dict[str, np.ndarray], np.ndarray]
-        - A dictionary mapping target instruments to separated audio sources if multiple instruments are present.
-        - A numpy array of the separated source if only one instrument is present.
-    """
-
-    mix = torch.tensor(mix, dtype=torch.float32)
-
-    if model_type == 'htdemucs':
-        mode = 'demucs'
-    else:
-        mode = 'generic'
-    # Define processing parameters based on the mode
-    if mode == 'demucs':
-        chunk_size = config.training.samplerate * config.training.segment
-        num_instruments = len(config.training.instruments)
-        num_overlap = config.inference.num_overlap
-        step = chunk_size // num_overlap
-    else:
-        chunk_size = config.audio.chunk_size
-        num_instruments = len(prefer_target_instrument(config))
-        num_overlap = config.inference.num_overlap
-
-        fade_size = chunk_size // 10
-        step = chunk_size // num_overlap
-        border = chunk_size - step
-        length_init = mix.shape[-1]
-        windowing_array = _getWindowingArray(chunk_size, fade_size)
-        # Add padding for generic mode to handle edge artifacts
-        if length_init > 2 * border and border > 0:
-            mix = nn.functional.pad(mix, (border, border), mode="reflect")
-
-    batch_size = config.inference.batch_size
-
-    use_amp = getattr(config.training, 'use_amp', True)
-
-    with torch.cuda.amp.autocast(enabled=use_amp):
-        with torch.inference_mode():
-            # Initialize result and counter tensors
-            req_shape = (num_instruments,) + mix.shape
-            result = torch.zeros(req_shape, dtype=torch.float32)
-            counter = torch.zeros(req_shape, dtype=torch.float32)
-
-            i = 0
-            batch_data = []
-            batch_locations = []
-            progress_bar = tqdm(
-                total=mix.shape[1], desc="Processing audio chunks", leave=False
-            ) if pbar else None
-
-            while i < mix.shape[1]:
-                # Extract chunk and apply padding if necessary
-                part = mix[:, i:i + chunk_size].to(device)
-                chunk_len = part.shape[-1]
-                if mode == "generic" and chunk_len > chunk_size // 2:
-                    pad_mode = "reflect"
-                else:
-                    pad_mode = "constant"
-                part = nn.functional.pad(part, (0, chunk_size - chunk_len), mode=pad_mode, value=0)
-
-                batch_data.append(part)
-                batch_locations.append((i, chunk_len))
-                i += step
-
-                # Process batch if it's full or the end is reached
-                if len(batch_data) >= batch_size or i >= mix.shape[1]:
-                    arr = torch.stack(batch_data, dim=0)
-                    x = model(arr)
-
-                    if mode == "generic":
-                        window = windowing_array.clone() # using clone() fixes the clicks at chunk edges when using batch_size=1
-                        if i - step == 0:  # First audio chunk, no fadein
-                            window[:fade_size] = 1
-                        elif i >= mix.shape[1]:  # Last audio chunk, no fadeout
-                            window[-fade_size:] = 1
-
-                    for j, (start, seg_len) in enumerate(batch_locations):
-                        if mode == "generic":
-                            result[..., start:start + seg_len] += x[j, ..., :seg_len].cpu() * window[..., :seg_len]
-                            counter[..., start:start + seg_len] += window[..., :seg_len]
-                        else:
-                            result[..., start:start + seg_len] += x[j, ..., :seg_len].cpu()
-                            counter[..., start:start + seg_len] += 1.0
-
-                    batch_data.clear()
-                    batch_locations.clear()
-
-                if progress_bar:
-                    progress_bar.update(step)
-
-            if progress_bar:
-                progress_bar.close()
-
-            # Compute final estimated sources
-            estimated_sources = result / counter
-            estimated_sources = estimated_sources.cpu().numpy()
-            np.nan_to_num(estimated_sources, copy=False, nan=0.0)
-
-            # Remove padding for generic mode
-            if mode == "generic":
-                if length_init > 2 * border and border > 0:
-                    estimated_sources = estimated_sources[..., border:-border]
-
-    # Return the result as a dictionary or a single array
-    if mode == "demucs":
-        instruments = config.training.instruments
+    if is_enhancement:
+        instruments = ['enhanced']
+        print("Validation mode: Enhancement")
     else:
         instruments = prefer_target_instrument(config)
+        print(f"Validation mode: Separation for instruments: {instruments}")
 
-    ret_data = {k: v for k, v in zip(instruments, estimated_sources)}
+    use_tta = getattr(args, 'use_tta', False)
+    store_dir = getattr(args, 'store_dir', '')
+    input_extension = getattr(args, 'extension', 'wav')
+    output_extension = config.get('inference', {}).get('extension', 'wav')
+    target_sr = config.get('audio', {}).get('sample_rate', 44100)
 
-    if mode == "demucs" and num_instruments <= 1:
-        return estimated_sources
-    else:
-        return ret_data
+    all_metrics = {
+        metric: {instr: [] for instr in instruments}
+        for metric in args.metrics
+    }
 
+    input_paths_iter = tqdm(input_paths, desc="Processing files") if is_tqdm else input_paths
 
-def prefer_target_instrument(config: ConfigDict) -> List[str]:
-    """
-        Return the list of target instruments based on the configuration.
-        If a specific target instrument is specified in the configuration,
-        it returns a list with that instrument. Otherwise, it returns the list of instruments.
+    for path_to_input in input_paths_iter:
+        start_time = time.time()
+        try:
+            input_audio, sr = read_audio_transposed(path_to_input)
+            if input_audio is None: raise IOError("Failed to read input audio.")
+        except Exception as e:
+             print(f"Error reading input {path_to_input}: {e}. Skipping.")
+             continue
 
-        Parameters:
-        ----------
-        config : ConfigDict
-            Configuration object containing the list of instruments or the target instrument.
+        original_clean = None
+        if is_enhancement:
+            folder = os.path.dirname(path_to_input)
+            base_name = os.path.splitext(os.path.basename(path_to_input))[0]
+            potential_orig_names = [
+                f"restored.wav", f"restored.flac",
+                f"{base_name}_orig.wav", f"{base_name}_orig.flac",
+                f"{base_name}_clean.wav", f"{base_name}_clean.flac",
+                f"{base_name}.wav", f"{base_name}.flac"
+            ]
+            path_to_original = None
+            for name in potential_orig_names:
+                 potential_path = os.path.join(folder, name)
+                 if os.path.exists(potential_path):
+                      path_to_original = potential_path
+                      if verbose: print(f"Found original reference: {path_to_original}")
+                      break
 
-        Returns:
-        -------
-        List[str]
-            A list of target instruments.
-        """
-    if getattr(config.training, 'target_instrument', None):
-        return [config.training.target_instrument]
-    else:
-        return config.training.instruments
-
-
-def load_not_compatible_weights(model: torch.nn.Module, weights: str, verbose: bool = False) -> None:
-    """
-    Load weights into a model, handling mismatched shapes and dimensions.
-
-    Args:
-        model: PyTorch model into which the weights will be loaded.
-        weights: Path to the weights file.
-        verbose: If True, prints detailed information about matching and mismatched layers.
-    """
-
-    new_model = model.state_dict()
-    old_model = torch.load(weights)
-    if 'state' in old_model:
-        # Fix for htdemucs weights loading
-        old_model = old_model['state']
-    if 'state_dict' in old_model:
-        # Fix for apollo weights loading
-        old_model = old_model['state_dict']
-
-    for el in new_model:
-        if el in old_model:
-            if verbose:
-                print(f'Match found for {el}!')
-            if new_model[el].shape == old_model[el].shape:
-                if verbose:
-                    print('Action: Just copy weights!')
-                new_model[el] = old_model[el]
+            if path_to_original:
+                 original_clean, sr_orig = read_audio_transposed(path_to_original)
+                 if original_clean is None:
+                      print(f"Warning: Failed to read original audio {path_to_original} for {path_to_input}. Cannot calculate metrics.")
+                 elif sr != sr_orig:
+                      print(f"Warning: SR mismatch between input ({sr}Hz) and original ({sr_orig}Hz) for {base_name}. Skipping metrics.")
+                      original_clean = None
             else:
-                if len(new_model[el].shape) != len(old_model[el].shape):
-                    if verbose:
-                        print('Action: Different dimension! Too lazy to write the code... Skip it')
-                else:
-                    if verbose:
-                        print(f'Shape is different: {tuple(new_model[el].shape)} != {tuple(old_model[el].shape)}')
-                    ln = len(new_model[el].shape)
-                    max_shape = []
-                    slices_old = []
-                    slices_new = []
-                    for i in range(ln):
-                        max_shape.append(max(new_model[el].shape[i], old_model[el].shape[i]))
-                        slices_old.append(slice(0, old_model[el].shape[i]))
-                        slices_new.append(slice(0, new_model[el].shape[i]))
-                    # print(max_shape)
-                    # print(slices_old, slices_new)
-                    slices_old = tuple(slices_old)
-                    slices_new = tuple(slices_new)
-                    max_matrix = np.zeros(max_shape, dtype=np.float32)
-                    for i in range(ln):
-                        max_matrix[slices_old] = old_model[el].cpu().numpy()
-                    max_matrix = torch.from_numpy(max_matrix)
-                    new_model[el] = max_matrix[slices_new]
-        else:
-            if verbose:
-                print(f'Match not found for {el}!')
-    model.load_state_dict(
-        new_model
-    )
+                 print(f"Warning: Could not find original clean audio for {path_to_input}. Cannot calculate metrics.")
+
+        mix_for_model = input_audio.copy()
+        mix_orig_for_metrics = original_clean.copy() if original_clean is not None else None
+        original_mixture_for_sep_metrics = input_audio.copy()
+
+        current_sr = sr
+        if sr != target_sr:
+             orig_length = mix_for_model.shape[-1]
+             if verbose: print(f'Resampling input {os.path.basename(path_to_input)} from {sr}Hz to {target_sr}Hz')
+             try:
+                 mix_for_model = librosa.resample(mix_for_model, orig_sr=sr, target_sr=target_sr, res_type='kaiser_best')
+                 if mix_orig_for_metrics is not None:
+                     mix_orig_for_metrics = librosa.resample(mix_orig_for_metrics, orig_sr=sr, target_sr=target_sr, res_type='kaiser_best')
+                 if not is_enhancement:
+                     original_mixture_for_sep_metrics = librosa.resample(original_mixture_for_sep_metrics, orig_sr=sr, target_sr=target_sr, res_type='kaiser_best')
+
+                 target_len = int(orig_length * target_sr / sr)
+                 mix_for_model = librosa.util.fix_length(mix_for_model, size=target_len)
+                 if mix_orig_for_metrics is not None: mix_orig_for_metrics = librosa.util.fix_length(mix_orig_for_metrics, size=target_len)
+                 if not is_enhancement: original_mixture_for_sep_metrics = librosa.util.fix_length(original_mixture_for_sep_metrics, size=target_len)
+                 current_sr = target_sr
+             except Exception as resample_e:
+                  print(f"Error during resampling for {path_to_input}: {resample_e}. Skipping file.")
+                  continue
+
+        if verbose:
+             folder_name = os.path.abspath(os.path.dirname(path_to_input))
+             print(f'File: {os.path.basename(path_to_input)} | Input Shape: {mix_for_model.shape} | SR: {current_sr}Hz')
+
+        norm_params = None
+        if config.get('inference', {}).get('normalize', False):
+             mix_for_model, norm_params = normalize_audio(mix_for_model)
+
+        try:
+             waveforms_orig = demix(config, model, mix_for_model, device, model_type=args.model_type, pbar=(not is_tqdm and verbose))
+        except Exception as demix_e:
+             print(f"Error during demix for {path_to_input}: {demix_e}. Skipping file.")
+             continue
+
+        if use_tta and not is_enhancement:
+             waveforms_orig = apply_tta(config, model, mix_for_model, waveforms_orig, device, args.model_type)
+        elif use_tta and is_enhancement and verbose:
+             print("Skipping TTA for enhancement task.")
+
+        pbar_dict = {}
+
+        for instr in instruments:
+            if instr not in waveforms_orig:
+                 print(f"Warning: Instrument '{instr}' not found in model output for {path_to_input}. Skipping.")
+                 continue
+            estimates = waveforms_orig[instr]
+
+            if current_sr != sr:
+                 try:
+                      estimates = librosa.resample(estimates, orig_sr=current_sr, target_sr=sr, res_type='kaiser_best')
+                      estimates = librosa.util.fix_length(estimates, size=input_audio.shape[-1])
+                 except Exception as resample_e:
+                      print(f"Error resampling output for {path_to_input}/{instr}: {resample_e}. Skipping metric calculation.")
+                      continue
+
+            if norm_params:
+                 estimates = denormalize_audio(estimates, norm_params)
+
+            if store_dir:
+                os.makedirs(store_dir, exist_ok=True)
+                file_base = os.path.splitext(os.path.basename(path_to_input))[0]
+                out_wav_name = f"{store_dir}/{file_base}_{instr}.{output_extension}"
+                try:
+                     sf.write(out_wav_name, estimates.T, sr, subtype='FLOAT')
+                     if args.draw_spectro > 0:
+                         out_img_name = f"{store_dir}/{file_base}_{instr}.jpg"
+                         draw_spectrogram(estimates.T, sr, args.draw_spectro, out_img_name)
+                         # Draw original/degraded spectrograms
+                         orig_to_draw = original_clean if is_enhancement and original_clean is not None else input_audio
+                         if orig_to_draw is not None:
+                             draw_spectrogram(orig_to_draw.T, sr, args.draw_spectro, f"{store_dir}/{file_base}_{instr}_orig_ref.jpg")
+                         if is_enhancement:
+                             draw_spectrogram(input_audio.T, sr, args.draw_spectro, f"{store_dir}/{file_base}_{instr}_input_degraded.jpg")
+                except Exception as write_e:
+                     print(f"Error writing output file {out_wav_name}: {write_e}")
 
 
-def load_lora_weights(model: torch.nn.Module, lora_path: str, device: str = 'cpu') -> None:
-    """
-    Load LoRA weights into a model.
-    This function updates the given model with LoRA-specific weights from the specified checkpoint file.
-    It does not require the checkpoint to match the model's full state dictionary, as only LoRA layers are updated.
+            reference_audio = None
+            mixture_context = None
+            if is_enhancement:
+                reference_audio = mix_orig_for_metrics
+                mixture_context = input_audio
+            else:
+                folder = os.path.dirname(path_to_input)
+                # Look for target stem with multiple extensions
+                path_to_target_stem = None
+                for ext in [input_extension, 'wav', 'flac']:
+                     potential_path = os.path.join(folder, f"{instr}.{ext}")
+                     if os.path.exists(potential_path):
+                          path_to_target_stem = potential_path
+                          break
+                if path_to_target_stem:
+                    reference_audio, sr_ref = read_audio_transposed(path_to_target_stem, instr, skip_err=True)
+                    if reference_audio is not None and sr_ref != sr:
+                         print(f"Warning: Sample rate mismatch for target stem {instr} ({sr_ref}Hz) vs input ({sr}Hz). Skipping metrics.")
+                         reference_audio = None # Invalidate reference
+                mixture_context = original_mixture_for_sep_metrics
 
-    Parameters:
-    ----------
-    model : Module
-        The PyTorch model into which the LoRA weights will be loaded.
-    lora_path : str
-        Path to the LoRA checkpoint file.
-    device : str, optional
-        The device to load the weights onto, by default 'cpu'. Common values are 'cpu' or 'cuda'.
+            if reference_audio is None:
+                 if verbose: print(f"Skipping metrics for {instr} - reference audio not available or invalid.")
+                 continue
 
-    Returns:
-    -------
-    None
-        The model is updated in place.
-    """
-    lora_state_dict = torch.load(lora_path, map_location=device)
-    model.load_state_dict(lora_state_dict, strict=False)
+            min_len = min(reference_audio.shape[-1], estimates.shape[-1])
+            reference_audio = reference_audio[..., :min_len]
+            estimates_for_metric = estimates[..., :min_len]
+            if mixture_context is not None:
+                 mixture_context = mixture_context[..., :min_len]
 
-
-def load_start_checkpoint(args: argparse.Namespace, model: torch.nn.Module, type_='train') -> None:
-    """
-    Load the starting checkpoint for a model.
-
-    Args:
-        args: Parsed command-line arguments containing the checkpoint path.
-        model: PyTorch model to load the checkpoint into.
-        type_: how to load weights - for train we can load not fully compatible weights
-    """
-
-    print(f'Start from checkpoint: {args.start_check_point}')
-    if type_ in ['train']:
-        if 1:
-            load_not_compatible_weights(model, args.start_check_point, verbose=False)
-        else:
-            model.load_state_dict(torch.load(args.start_check_point))
-    else:
-        device='cpu'
-        if args.model_type in ['htdemucs', 'apollo']:
-            state_dict = torch.load(args.start_check_point, map_location=device, weights_only=False)
-            # Fix for htdemucs pretrained models
-            if 'state' in state_dict:
-                state_dict = state_dict['state']
-            # Fix for apollo pretrained models
-            if 'state_dict' in state_dict:
-                state_dict = state_dict['state_dict']
-        else:
-            state_dict = torch.load(args.start_check_point, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
-
-    if args.lora_checkpoint:
-        print(f"Loading LoRA weights from: {args.lora_checkpoint}")
-        load_lora_weights(model, args.lora_checkpoint)
-
-
-def bind_lora_to_model(config: Dict[str, Any], model: nn.Module) -> nn.Module:
-    """
-    Replaces specific layers in the model with LoRA-extended versions.
-
-    Parameters:
-    ----------
-    config : Dict[str, Any]
-        Configuration containing parameters for LoRA. It should include a 'lora' key with parameters for `MergedLinear`.
-    model : nn.Module
-        The original model in which the layers will be replaced.
-
-    Returns:
-    -------
-    nn.Module
-        The modified model with the replaced layers.
-    """
-
-    if 'lora' not in config:
-        raise ValueError("Configuration must contain the 'lora' key with parameters for LoRA.")
-
-    replaced_layers = 0  # Counter for replaced layers
-
-    for name, module in model.named_modules():
-        hierarchy = name.split('.')
-        layer_name = hierarchy[-1]
-
-        # Check if this is the target layer to replace (and layer_name == 'to_qkv')
-        if isinstance(module, nn.Linear):
             try:
-                # Get the parent module
-                parent_module = model
-                for submodule_name in hierarchy[:-1]:
-                    parent_module = getattr(parent_module, submodule_name)
+                 track_metrics = get_metrics(
+                     args.metrics,
+                     reference=reference_audio,
+                     estimate=estimates_for_metric,
+                     mix=mixture_context,
+                     device=device,
+                 )
+                 update_metrics_and_pbar(
+                     track_metrics, all_metrics, instr, pbar_dict,
+                     input_paths_iter, verbose=verbose
+                 )
+            except Exception as metric_e:
+                 print(f"Error calculating metrics for {path_to_input}/{instr}: {metric_e}")
 
-                # Replace the module with LoRA-enabled layer
-                setattr(
-                    parent_module,
-                    layer_name,
-                    lora.MergedLinear(
-                        in_features=module.in_features,
-                        out_features=module.out_features,
-                        bias=module.bias is not None,
-                        **config['lora']
-                    )
-                )
-                replaced_layers += 1  # Increment the counter
 
-            except Exception as e:
-                print(f"Error replacing layer {name}: {e}")
+        if verbose:
+            print(f"Time for file: {time.time() - start_time:.2f} sec")
 
-    if replaced_layers == 0:
-        print("Warning: No layers were replaced. Check the model structure and configuration.")
+    return all_metrics
+
+
+def compute_metric_avg(
+    store_dir: str,
+    args,
+    instruments: List[str],
+    config: ConfigDict,
+    all_metrics: Dict[str, Dict[str, List[float]]],
+    start_time: float
+) -> Dict[str, float]:
+    """ Calculate and log average metrics. """
+    logs = []
+    verbose_logging = bool(store_dir)
+
+    if verbose_logging:
+        logs.append(str(args))
+        if hasattr(config, 'inference'):
+             logs.append(f"Num overlap: {config.inference.get('num_overlap', 'N/A')}")
+
+    metric_avg = {}
+    if not all_metrics or not any(all_metrics.values()):
+         print("No metrics were calculated.")
+         return metric_avg
+
+    valid_instruments_count = 0
+    for instr in instruments:
+        instr_has_metrics = False
+        for metric_name in args.metrics:
+            if metric_name in all_metrics and instr in all_metrics[metric_name] and all_metrics[metric_name][instr]:
+                instr_has_metrics = True
+                metric_values = np.array(all_metrics[metric_name][instr])
+                # Filter out potential NaNs or Infs before calculating mean/std
+                valid_metric_values = metric_values[np.isfinite(metric_values)]
+                if valid_metric_values.size == 0:
+                    print(f"Warning: No valid metric values for {instr}/{metric_name}")
+                    continue
+
+                mean_val = valid_metric_values.mean()
+                std_val = valid_metric_values.std()
+
+                log_text = f"Instr {instr} {metric_name}: {mean_val:.4f} (Std: {std_val:.4f}) Count: {len(valid_metric_values)}"
+                logging(logs, text=log_text, verbose_logging=verbose_logging)
+
+                if metric_name not in metric_avg: metric_avg[metric_name] = 0.0
+                metric_avg[metric_name] += mean_val
+
+        if instr_has_metrics:
+            valid_instruments_count += 1
+
+    if valid_instruments_count > 0:
+        for metric_name in metric_avg:
+            metric_avg[metric_name] /= valid_instruments_count
+
+        if valid_instruments_count > 1 or len(instruments) == 1:
+            for metric_name in metric_avg:
+                log_text = f'Metric avg {metric_name:11s}: {metric_avg[metric_name]:.4f}'
+                logging(logs, text=log_text, verbose_logging=verbose_logging)
     else:
-        print(f"Number of layers replaced with LoRA: {replaced_layers}")
+         print("No valid instruments found with metrics to average.")
 
-    return model
+    log_text = f"Elapsed time: {time.time() - start_time:.2f} sec"
+    logging(logs, text=log_text, verbose_logging=verbose_logging)
+
+    if store_dir:
+        write_results_in_file(store_dir, logs)
+
+    return metric_avg
 
 
-def draw_spectrogram(waveform, sample_rate, length, output_file):
-    import librosa.display
+def valid(
+    model: torch.nn.Module,
+    args,
+    config: ConfigDict,
+    device: torch.device,
+    verbose: bool = False
+) -> Tuple[dict, dict]:
+    """ Validate a trained model (separation or enhancement). """
+    start_time = time.time()
+    model.eval().to(device)
 
-    # Cut only required part of spectorgram
-    x = waveform[:int(length * sample_rate), :]
-    X = librosa.stft(x.mean(axis=-1))  # perform short-term fourier transform on mono signal
-    Xdb = librosa.amplitude_to_db(np.abs(X), ref=np.max)  # convert an amplitude spectrogram to dB-scaled spectrogram.
-    fig, ax = plt.subplots()
-    # plt.figure(figsize=(30, 10))  # initialize the fig size
-    img = librosa.display.specshow(
-        Xdb,
-        cmap='plasma',
-        sr=sample_rate,
-        x_axis='time',
-        y_axis='linear',
-        ax=ax
-    )
-    ax.set(title='File: ' + os.path.basename(output_file))
-    fig.colorbar(img, ax=ax, format="%+2.f dB")
-    if output_file is not None:
-        plt.savefig(output_file)
+    store_dir = getattr(args, 'store_dir', '')
+    extension = getattr(args, 'extension', 'wav') 
+    is_enhancement = config.training.get('is_gan', False) and args.model_type == 'apollo'
+
+    all_input_paths = get_mixture_paths(args, verbose, config, extension, is_enhancement)
+    if not all_input_paths:
+        print("No input files found for validation.")
+        return {}, {}
+
+    all_metrics = process_audio_files(all_input_paths, model, args, config, device, verbose, not verbose)
+
+    instruments = ['enhanced'] if is_enhancement else prefer_target_instrument(config)
+
+    return compute_metric_avg(store_dir, args, instruments, config, all_metrics, start_time), all_metrics
+
+
+def validate_in_subprocess(
+    proc_id: int,
+    queue: torch.multiprocessing.Queue,
+    all_input_paths: List[str],
+    model: torch.nn.Module,
+    args,
+    config: ConfigDict,
+    device: str,
+    return_dict
+) -> None:
+    """ Perform validation on a subprocess. """
+    try: 
+        m1 = model.eval().to(device)
+        is_enhancement = config.training.get('is_gan', False) and args.model_type == 'apollo'
+        instruments = ['enhanced'] if is_enhancement else config.training.instruments
+
+        if proc_id == 0:
+            progress_bar = tqdm(total=len(all_input_paths), desc="MultiGPU Validation")
+
+        all_metrics_proc = {
+            metric: {instr: [] for instr in instruments}
+            for metric in args.metrics
+        }
+
+        while True:
+            item = queue.get()
+            if item is None: break
+            current_step, path = item
+
+            try:
+                single_file_metrics = process_audio_files([path], m1, args, config, device, False, False)
+                pbar_dict = {}
+                for metric_name in args.metrics:
+                    for instr in instruments:
+                        values = single_file_metrics.get(metric_name, {}).get(instr, [])
+                        if values:
+                            if metric_name not in all_metrics_proc: all_metrics_proc[metric_name] = {}
+                            if instr not in all_metrics_proc[metric_name]: all_metrics_proc[metric_name][instr] = []
+                            all_metrics_proc[metric_name][instr].extend(values)
+                            pbar_dict[f"{metric_name}_{instr}"] = f"{values[0]:.4f}"
+
+                if proc_id == 0:
+                    progress_bar.update(1) # Simple update by 1 per item processed
+                    progress_bar.set_postfix(pbar_dict)
+            except Exception as e:
+                 print(f"Error in subprocess {proc_id} processing {path}: {e}")
+
+        return_dict[proc_id] = all_metrics_proc
+        if proc_id == 0 and 'progress_bar' in locals(): progress_bar.close()
+    except Exception as e:
+         print(f"Critical error in subprocess {proc_id}: {e}")
+         return_dict[proc_id] = {} # Return empty dict on critical failure
+    finally:
+         if proc_id == 0 and 'progress_bar' in locals() and not progress_bar.disable:
+              try:
+                  progress_bar.close()
+              except Exception: pass
+
+
+def run_parallel_validation(
+    verbose: bool,
+    all_input_paths: List[str],
+    config: ConfigDict,
+    model: torch.nn.Module,
+    device_ids: List[int],
+    args,
+    return_dict
+) -> None:
+    """ Run parallel validation using multiple processes. """
+    model_cpu = model.to('cpu')
+    if isinstance(model_cpu, nn.DataParallel):
+        model_cpu = model_cpu.module
+
+    # Use spawn context for better compatibility, especially with CUDA
+    mp_context = torch.multiprocessing.get_context('spawn')
+    queue = mp_context.Queue()
+    processes = []
+
+    num_devices = len(device_ids) if torch.cuda.is_available() else 1
+
+    for i in range(num_devices):
+        if torch.cuda.is_available():
+            device_str = f'cuda:{device_ids[i]}'
+        else:
+            device_str = 'cpu'
+        p = mp_context.Process(
+            target=validate_in_subprocess,
+            args=(i, queue, all_input_paths, model_cpu, args, config, device_str, return_dict)
+        )
+        p.start()
+        processes.append(p)
+
+    for i, path in enumerate(all_input_paths):
+        queue.put((i + 1, path))
+
+    for _ in range(num_devices):
+        queue.put(None)
+
+    for p in processes:
+        p.join()
+
+    queue.close()
+    queue.join_thread()
+
+
+def valid_multi_gpu(
+    model: torch.nn.Module,
+    args,
+    config: ConfigDict,
+    device_ids: List[int],
+    verbose: bool = False
+) -> Tuple[Dict[str, float], dict]:
+    """ Perform validation across multiple GPUs. """
+    start_time = time.time()
+
+    store_dir = getattr(args, 'store_dir', '')
+    extension = getattr(args, 'extension', 'wav')
+    is_enhancement = config.training.get('is_gan', False) and args.model_type == 'apollo'
+
+    all_input_paths = get_mixture_paths(args, verbose, config, extension, is_enhancement)
+    if not all_input_paths:
+        print("No input files found for validation.")
+        return {}, {}
+
+    mp_context = torch.multiprocessing.get_context('spawn')
+    manager = mp_context.Manager()
+    return_dict = manager.dict()
+
+    run_parallel_validation(verbose, all_input_paths, config, model, device_ids, args, return_dict)
+
+    aggregated_metrics = {}
+    instruments_list = ['enhanced'] if is_enhancement else prefer_target_instrument(config)
+
+    num_processes = len(return_dict)
+
+    for metric in args.metrics:
+        aggregated_metrics[metric] = {}
+        for instr in instruments_list:
+            aggregated_metrics[metric][instr] = []
+            for i in range(num_processes):
+                # Check if key exists before accessing
+                if i in return_dict:
+                    proc_metrics = return_dict[i]
+                    if metric in proc_metrics and instr in proc_metrics[metric]:
+                         aggregated_metrics[metric][instr].extend(proc_metrics[metric][instr])
+                else:
+                     print(f"Warning: Results from process {i} not found in return_dict.")
+
+
+    return compute_metric_avg(store_dir, args, instruments_list, config, aggregated_metrics, start_time), aggregated_metrics
+
+
+def parse_args(dict_args: Union[Dict, None]) -> argparse.Namespace:
+    """ Parse command-line arguments for validation. """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_type", type=str, default='mdx23c',
+                        help="One of mdx23c, htdemucs, segm_models, mel_band_roformer, bs_roformer, swin_upernet, bandit, apollo")
+    parser.add_argument("--config_path", type=str, help="Path to config file")
+    parser.add_argument("--start_check_point", type=str, default='', help="Checkpoint to validate")
+    parser.add_argument("--valid_path", nargs="+", type=str, help="Validation data path(s)")
+    parser.add_argument("--store_dir", type=str, default="", help="Path to store results (wav, spectrograms)")
+    parser.add_argument("--draw_spectro", type=float, default=0,
+                        help="Generate spectrograms for N seconds of output stems if --store_dir is set.")
+    parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='List of GPU IDs')
+    parser.add_argument("--num_workers", type=int, default=0, help="Dataloader num_workers (Not used in current valid.py)")
+    parser.add_argument("--pin_memory", action='store_true', help="Dataloader pin_memory (Not used in current valid.py)")
+    parser.add_argument("--extension", type=str, default='wav', help="Input file extension for validation")
+    parser.add_argument("--use_tta", action='store_true',
+                        help="Use Test-Time Augmentation (not recommended for enhancement)")
+    parser.add_argument("--metrics", nargs='+', type=str, default=["sdr"],
+                        choices=['sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
+                                 'fullness'], help='List of metrics to calculate.')
+    parser.add_argument("--lora_checkpoint", type=str, default='', help="Path to LoRA weights checkpoint")
+
+    if dict_args is not None:
+        args = parser.parse_args([])
+        args_dict = vars(args)
+        args_dict.update(dict_args)
+        args = argparse.Namespace(**args_dict)
+    else:
+        args = parser.parse_args()
+
+    return args
+
+
+def check_validation(dict_args):
+    """ Main function to run validation """
+    args = parse_args(dict_args)
+    torch.backends.cudnn.benchmark = True 
+
+    model_or_models, config = get_model_from_config(args.model_type, args.config_path)
+    is_gan = isinstance(model_or_models, tuple)
+
+    model_to_validate = model_or_models[0] if is_gan else model_or_models
+
+    if args.start_check_point:
+        load_start_checkpoint(args, model_or_models, type_='valid')
+
+    print(f"Instruments/Task: {'Enhancement' if is_gan else config.training.get('instruments', 'N/A')}")
+
+    device_ids = args.device_ids
+    if torch.cuda.is_available():
+        if not device_ids: device_ids = [0]
+        device = torch.device(f'cuda:{device_ids[0]}')
+        print(f"Using CUDA device(s): {device_ids}")
+    else:
+        device = torch.device('cpu')
+        device_ids = []
+        print('CUDA is not available. Running validation on CPU.')
+
+    if torch.cuda.is_available() and len(device_ids) > 1:
+        print("Running multi-GPU validation...")
+        valid_multi_gpu(model_to_validate, args, config, device_ids, verbose=False)
+    else:
+        print("Running single-device validation...")
+        valid(model_to_validate, args, config, device, verbose=True)
+
+
+if __name__ == "__main__":
+    # Set start method for multiprocessing if running directly
+    try:
+        torch.multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass # Ignore if already set or not applicable
+    check_validation(None)
