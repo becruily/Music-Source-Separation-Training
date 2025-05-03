@@ -12,7 +12,7 @@ This example trains Apollo to restore quality from simulated MP3 compression app
 ```bash
 python train.py ^
     --model_type apollo ^
-    --config_path configs/apollo_config.yaml ^
+    --config_path configs/config_apollo.yaml ^
     --start_check_point "" ^
     --results_path results/ ^
     --data_path "D:\TrainingDataClean" ^
@@ -31,7 +31,7 @@ python train.py ^
 ```bash
 python inference.py ^
     --model_type apollo ^
-    --config_path configs/apollo_config.yaml ^
+    --config_path configs/config_apollo.yaml ^
     --start_check_point results/apollo_stem_enhancement/last_apollo.ckpt ^
     --input_folder "D:\AudioToEnhance" ^
     --store_dir enhanced_results/ ^
