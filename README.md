@@ -1,122 +1,91 @@
-# Music Source Separation Universal Training Code
+# Music Source Separation & Enhancement Training Code
 
-Repository for training models for music source separation. Repository is based on [kuielab code](https://github.com/kuielab/sdx23/tree/mdx_AB/my_submission/src) for [SDX23 challenge](https://github.com/kuielab/sdx23/tree/mdx_AB/my_submission/src). The main idea of this repository is to create training code, which is easy to modify for experiments. Brought to you by [MVSep.com](https://mvsep.com).
+This repository is based on pipeline for training models for **music source separation** and includes **audio enhancement** model using the [Apollo](https://github.com/JusperLee/Apollo) architecture.
 
-## Models
 
-Model can be chosen with `--model_type` arg.
+## Training
 
-Available models for training:
+### Training Example (Apollo Enhancement - Type 5: On-the-Fly Degradation)
 
-* MDX23C based on [KUIELab TFC TDF v3 architecture](https://github.com/kuielab/sdx23/). Key: `mdx23c`.
-* Demucs4HT [[Paper](https://arxiv.org/abs/2211.08553)]. Key: `htdemucs`.
-* VitLarge23 based on [Segmentation Models Pytorch](https://github.com/qubvel/segmentation_models.pytorch). Key: `segm_models`.
-* TorchSeg based on [TorchSeg module](https://github.com/qubvel/segmentation_models.pytorch). Key: `torchseg`.
-* Band Split RoFormer [[Paper](https://arxiv.org/abs/2309.02612), [Repository](https://github.com/lucidrains/BS-RoFormer)] . Key: `bs_roformer`.
-* Mel-Band RoFormer [[Paper](https://arxiv.org/abs/2310.01809), [Repository](https://github.com/lucidrains/BS-RoFormer)]. Key: `mel_band_roformer`.
-* Swin Upernet [[Paper](https://arxiv.org/abs/2103.14030)] Key: `swin_upernet`.
-* BandIt Plus [[Paper](https://arxiv.org/abs/2309.02539), [Repository](https://github.com/karnwatcharasupat/bandit)] Key: `bandit`.
-* SCNet [[Paper](https://arxiv.org/abs/2401.13276), [Official Repository](https://github.com/starrytong/SCNet), [Unofficial Repository](https://github.com/amanteur/SCNet-PyTorch)] Key: `scnet`.
-* BandIt v2 [[Paper](https://arxiv.org/abs/2407.07275), [Repository](https://github.com/kwatcharasupat/bandit-v2)] Key: `bandit_v2`.
-* Apollo [[Paper](https://arxiv.org/html/2409.08514v1), [Repository](https://github.com/JusperLee/Apollo)] Key: `apollo`.
-* TS BSMamba2 [[Paper](https://arxiv.org/pdf/2409.06245), [Repository](https://github.com/baijinglin/TS-BSmamba2)] Key: `bs_mamba2`.
-* SCNet Tran Key: `scnet_tran`.
-
-1. **Note 1**: For `segm_models` there are many different encoders is possible. [Look here](https://github.com/qubvel/segmentation_models.pytorch#encoders-).
-2. **Note 2**: Thanks to [@lucidrains](https://github.com/lucidrains) for recreating the RoFormer models based on papers.
-3. **Note 3**: For `torchseg` gives access to more than 800 encoders from `timm` module. It's similar to `segm_models`.
-
-## How to: Train
-
-To train model you need to:
-
-1) Choose model type with option `--model_type`, including: `mdx23c`, `htdemucs`, `segm_models`, `mel_band_roformer`, `bs_roformer`.
-2) Choose location of config for model `--config_path` `<config path>`. You can find examples of configs in [configs folder](configs/). Prefixes `config_musdb18_` are examples for [MUSDB18 dataset](https://sigsep.github.io/datasets/musdb.html).
-3) If you have a check-point from the same model or from another similar model you can use it with option: `--start_check_point` `<weights path>`
-4) Choose path where to store results of training `--results_path` `<results folder path>`
-
-### Training example
+This example trains Apollo to restore quality from simulated MP3 compression applied during training.
 
 ```bash
-python train.py \
-    --model_type mel_band_roformer \
-    --config_path configs/config_mel_band_roformer_vocals.yaml \
-    --start_check_point results/model.ckpt \
-    --results_path results/ \
-    --data_path 'datasets/dataset1' 'datasets/dataset2' \
-    --valid_path datasets/musdb18hq/test \
-    --num_workers 4 \
+python train.py ^
+    --model_type apollo ^
+    --config_path configs/apollo_config.yaml ^
+    --start_check_point "" ^
+    --results_path results/ ^
+    --data_path "D:\TrainingDataClean" ^
+    --valid_path "D:\Validation" ^
+    --dataset_type 5 ^
+    --num_workers 4 ^
+    --device_ids 0 ^
+    --metrics aura_mrstft ^
+    --metric_for_scheduler aura_mrstft
+```
+
+## Inference
+
+### Inference Example (Apollo Enhancement)
+
+```bash
+python inference.py ^
+    --model_type apollo ^
+    --config_path configs/apollo_config.yaml ^
+    --start_check_point results/apollo_stem_enhancement/last_apollo.ckpt ^
+    --input_folder "D:\AudioToEnhance" ^
+    --store_dir enhanced_results/ ^
     --device_ids 0
 ```
 
-All training parameters are [here](https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/train.py#L45).
 
-### Training with LoRA
 
-Look here: [LoRA training](docs/LoRA.md)
+## Dataset Types (`--dataset_type`)
 
-## How to: Inference
 
-### Inference example
+*   **Types 1, 2, 3, 4:** Designed for **Source Separation**. They expect different structures for loading individual instrument stems and potentially mixtures. See the original [Dataset Types Documentation](https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/docs/dataset_types.md) for details.
 
-```bash
-python inference.py \
-    --model_type mdx23c \
-    --config_path configs/config_mdx23c_musdb18.yaml \
-    --start_check_point results/last_mdx23c.ckpt \
-    --input_folder input/wavs/ \
-    --store_dir separation_results/
-```
+*   **Type 5:** Designed for **Audio Enhancement (On-the-Fly Degradation)**.
+    *   **Use Case:** Training Apollo to restore audio quality lost due to simulated codec compression (e.g., MP3).
+    *   **Training Data (`--data_path`):** Should contain folders with **ONLY CLEAN/ORIGINAL** audio files (`.wav`, `.flac`). The dataloader will randomly select chunks and apply simulated MP3 compression (using `pedalboard`). Filenames of the clean files do not matter.
+        ```
+        D:\TrainingDataClean\
+        ├── song1.wav
+        ├── song2.flac
+        └── ...
+        ```
+    *   **Validation Data (`--valid_path`):** Should contain folders with **PAIRS** of pre-degraded audio and their corresponding clean originals. **A consistent naming is required** so the script can find the clean original files based on the degraded files' names. The current script supports finding clean files with suffixes `_orig`, `_clean`.
+        ```
+        D:\ValidationEnhancementPairs\
+        ├── SongA\
+        │   ├── dirty.wav    # e.g., Degraded audio
+        │   └── clean.flac   # e.g., Original quality audio
+        ├── SongB\
+        │   ├── dirty.flac   # e.g., Degraded audio
+        │   └── clean.wav    # e.g., Original quality audio
+        └── ...
+        ```
 
-All inference parameters are [here](https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/inference.py#L108).
+*   **Type 6:** Designed for **Audio Enhancement (Pre-Defined Pairs)**.
+    *   **Use Case:** Training Apollo to enhance audio where you already have explicit pairs of "dirty" and "clean" files. This is ideal for tasks like enhancing stems previously separated by another model, where the original clean stem is available.
+    *   **Training Data (`--data_path`):** Should point to a directory containing **subfolders** for each song/example. Inside each subfolder, there must be exactly one "dirty" audio file and one "clean" audio file.
+        *   **Naming:** The script looks for files named **exactly** `dirty.wav` (or `.flac`) and `clean.wav` (or `.flac`) within each subfolder.
+        ```
+        D:\StemEnhancementTrain\
+        ├── SongA\
+        │   ├── dirty.wav    # e.g., Separated vocals
+        │   └── clean.flac   # e.g., Original studio vocals
+        ├── SongB\
+        │   ├── dirty.flac   # e.g., Separated drums
+        │   └── clean.wav    # e.g., Original drum stem
+        └── ...
+        ```
+    *   **Validation Data (`--valid_path`):** Similar to Type 5. It must follow the **exact same structure and naming** as the training data (subfolders containing `dirty.wav`/`.flac` and `clean.wav`/`.flac`). The script will process the `dirty` file and compare the output against the `clean` file for metrics.
 
-## Useful notes
+## Key Differences from Original Apollo Code
 
-* All batch sizes in config are adjusted to use with single NVIDIA A6000 48GB. If you have less memory please adjust correspodningly in model config `training.batch_size` and `training.gradient_accumulation_steps`.
-* It's usually always better to start with old weights even if shapes not fully match. Code supports loading weights for not fully same models (but it must have the same architecture). Training will be much faster.
+*   **Checkpointing:** Saves only model weights (`generator_state_dict` and `discriminator_state_dict` for Apollo) in `.ckpt` files. To use Apollo checkpoints with other tools (like UVR), you may need to extract the `generator_state_dict`.
+*   **Dataset Loading:** Integrated into the existing `MSSDataset` class with specific logic for Types 5 and 6, rather than using the original `MusdbMoisesdbDataModule`.
+*   **Codec Simulation (Type 5):** Uses `pedalboard` for MP3 simulation for better cross-platform compatibility compared to the original `torchaudio.functional.apply_codec`.
 
-## Code description
-
-* `configs/config_*.yaml` - configuration files for models
-* `models/*` - set of available models for training and inference
-* `dataset.py` - dataset which creates new samples for training
-* `gui-wx.py` - GUI interface for code
-* `inference.py` - process folder with music files and separate them
-* `train.py` - main training code
-* `train_accelerate.py` - experimental training code to use with `accelerate` module. Speed up for MultiGPU.
-* `utils.py` - common functions used by train/valid
-* `valid.py` - validation of model with metrics
-* `ensemble.py` - useful script to ensemble results of different models to make results better (see [docs](docs/ensemble.md)).   
-
-## Pre-trained models
-
-Look here: [List of Pre-trained models](docs/pretrained_models.md)
-
-If you trained some good models, please, share them. You can post config and model weights [in this issue](https://github.com/ZFTurbo/Music-Source-Separation-Training/issues/1).
-
-## Dataset types
-
-Look here: [Dataset types](docs/dataset_types.md)
-
-## Augmentations
-
-Look here: [Augmentations](docs/augmentations.md)
-
-## Graphical user interface
-
-Look here: [GUI documentation](docs/gui.md) or see tutorial on [Youtube](https://youtu.be/M8JKFeN7HfU)
-
-## Citation
-
-* [arxiv paper](https://arxiv.org/abs/2305.07489)
-
-```text
-@misc{solovyev2023benchmarks,
-      title={Benchmarks and leaderboards for sound demixing tasks}, 
-      author={Roman Solovyev and Alexander Stempkovskiy and Tatiana Habruseva},
-      year={2023},
-      eprint={2305.07489},
-      archivePrefix={arXiv},
-      primaryClass={cs.SD}
-}
 ```
