@@ -1,6 +1,6 @@
 # Music Source Separation & Enhancement Training Code
 
-This repository is based on [this pipeline for training models for **music source separation**](https://github.com/ZFTurbo/Music-Source-Separation-Training) and includes **audio enhancement** model using the [Apollo](https://github.com/JusperLee/Apollo) architecture.
+This repository is based on [this pipeline](https://github.com/ZFTurbo/Music-Source-Separation-Training) for training models for **music source separation** and includes **audio enhancement** model using the [Apollo architecture](https://github.com/JusperLee/Apollo).
 
 
 ## Training
