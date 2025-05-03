@@ -58,11 +58,11 @@ python inference.py ^
         ```
         D:\ValidationEnhancementPairs\
         ├── SongA\
-        │   ├── dirty.wav    # e.g., Degraded audio
-        │   └── clean.flac   # e.g., Original quality audio
+        │   ├── dirty.wav    # Degraded audio
+        │   └── clean.flac   # Original quality audio
         ├── SongB\
-        │   ├── dirty.flac   # e.g., Degraded audio
-        │   └── clean.wav    # e.g., Original quality audio
+        │   ├── dirty.flac   # Degraded audio
+        │   └── clean.wav    # Original quality audio
         └── ...
         ```
 
@@ -73,11 +73,11 @@ python inference.py ^
         ```
         D:\StemEnhancementTrain\
         ├── SongA\
-        │   ├── dirty.wav    # e.g., Separated vocals
-        │   └── clean.flac   # e.g., Original studio vocals
+        │   ├── dirty.wav    # Separated vocals
+        │   └── clean.flac   # Original studio vocals
         ├── SongB\
-        │   ├── dirty.flac   # e.g., Separated drums
-        │   └── clean.wav    # e.g., Original drum stem
+        │   ├── dirty.flac   # Separated drums
+        │   └── clean.wav    # Original drum stem
         └── ...
         ```
     *   **Validation Data (`--valid_path`):** Similar to Type 5. It must follow the **exact same structure and naming** as the training data (subfolders containing `dirty.wav`/`.flac` and `clean.wav`/`.flac`). The script will process the `dirty` file and compare the output against the `clean` file for metrics.
